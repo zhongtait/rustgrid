@@ -151,10 +151,17 @@ async fn connect(config: &ConnectionConfig, engine: Engine) -> Result<Box<dyn Co
     let mut options = MySqlConnectOptions::new()
         .host(&host)
         .port(port)
-        .username(&config.username);
+        .username(&config.username)
+        .pipes_as_concat(false)
+        .no_engine_substitution(false)
+        .timezone(None)
+        .set_names(false)
+        .statement_cache_capacity(0);
 
-    if let Some(database) = &config.database {
-        options = options.database(database);
+    if let Some(database) = &config.database
+        && !database.trim().is_empty()
+    {
+        options = options.database(database.trim());
     }
 
     if let Some(password) = &config.password {
@@ -183,7 +190,9 @@ async fn connect(config: &ConnectionConfig, engine: Engine) -> Result<Box<dyn Co
     }
 
     // Pool: connection timeout and keep-alive.
-    let mut pool_options = MySqlPoolOptions::new().max_connections(5);
+    let mut pool_options = MySqlPoolOptions::new()
+        .max_connections(5)
+        .test_before_acquire(false);
     if let Some(seconds) = settings.connect_timeout.filter(|seconds| *seconds > 0) {
         pool_options = pool_options.acquire_timeout(Duration::from_secs(seconds));
     }

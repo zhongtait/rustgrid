@@ -132,3 +132,7 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+sqlx-mysql = { path = "patches/sqlx-mysql" }
+
