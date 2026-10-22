@@ -33,6 +33,10 @@ impl ProtocolEncode<'_, Capabilities> for HandshakeResponse<'_> {
         buf: &mut Vec<u8>,
         mut context: Capabilities,
     ) -> Result<(), crate::Error> {
+        if self.database.is_none() {
+            context.remove(Capabilities::CONNECT_WITH_DB);
+        }
+
         if self.auth_plugin.is_none() {
             // ensure PLUGIN_AUTH is set *only* if we have a defined plugin
             context.remove(Capabilities::PLUGIN_AUTH);

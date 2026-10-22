@@ -106,8 +106,8 @@ impl ConnectOptions for MySqlConnectOptions {
         }
 
         if !options.is_empty() {
-            conn.execute(AssertSqlSafe(format!(r#"SET {};"#, options.join(","))))
-                .await?;
+            let _ = conn.execute(AssertSqlSafe(format!(r#"SET {};"#, options.join(","))))
+                .await;
         }
 
         Ok(conn)

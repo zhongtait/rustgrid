@@ -72,7 +72,7 @@ impl ProtocolDecode<'_> for Handshake {
         };
 
         let auth_plugin = if capabilities.contains(Capabilities::PLUGIN_AUTH) {
-            Some(buf.get_str_nul()?.parse()?)
+            Some(buf.get_str_nul()?.parse().unwrap_or(AuthPlugin::MySqlNativePassword))
         } else {
             None
         };

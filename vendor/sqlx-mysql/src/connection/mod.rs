@@ -21,7 +21,7 @@ mod executor;
 mod stream;
 mod tls;
 
-const MAX_PACKET_SIZE: u32 = 1024;
+const MAX_PACKET_SIZE: u32 = 16 * 1024 * 1024;
 
 /// The charset parameter sent in the `Protocol::HandshakeResponse41` packet.
 ///

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
@@ -110,7 +111,14 @@ impl MysqlConnection {
             quote_identifier(database),
             quote_identifier(name)
         );
-        let result = self.execute_query(Some(database), &sql).await?;
+        let res = self.execute_query(Some(database), &sql).await;
+        let result = match res {
+            Ok(r) => r,
+            Err(_) => {
+                let fallback_sql = format!("SHOW CREATE {verb} {}", quote_identifier(name));
+                self.execute_query(Some(database), &fallback_sql).await?
+            }
+        };
         let index = result
             .columns
             .iter()
@@ -158,6 +166,415 @@ impl MysqlConnection {
             rows: Vec::new(),
         })
     }
+
+    async fn list_tables_show(&self, database: &str) -> Result<Vec<TableInfo>> {
+        let mut connection = self.pool.acquire().await.map_err(map_query_error)?;
+        if !database.is_empty() {
+            let _ = use_database(&mut connection, database).await;
+        }
+
+        // Try standard syntax variations in order of preference:
+        // 1. Bare identifier queries for proxies like MyCAT whose regex requires unquoted \w+
+        // 2. Quoted syntax `SHOW FULL TABLES FROM `database` ` (standard MySQL/JDBC)
+        // 3. Fallbacks `SHOW FULL TABLES ` / `SHOW TABLES ` (relying on USE database)
+        let queries = if !database.is_empty() {
+            let is_bare = database
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+            let mut list = Vec::new();
+            if is_bare {
+                list.push(format!("SHOW FULL TABLES FROM {database} "));
+                list.push(format!("SHOW TABLES FROM {database} "));
+            }
+            list.push(format!(
+                "SHOW FULL TABLES FROM {} ",
+                quote_identifier(database)
+            ));
+            list.push(format!("SHOW TABLES FROM {} ", quote_identifier(database)));
+            list.push("SHOW FULL TABLES ".to_string());
+            list.push("SHOW TABLES ".to_string());
+            list
+        } else {
+            vec!["SHOW FULL TABLES ".to_string(), "SHOW TABLES ".to_string()]
+        };
+
+        let mut parsed_tables = Vec::new();
+        for query in queries {
+            if let Ok(rows) = sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+                .fetch_all(&mut *connection)
+                .await
+            {
+                let mut tables = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    if let Some(info) = parse_table_row(row, database) {
+                        tables.push(info);
+                    }
+                }
+                if !tables.is_empty() {
+                    parsed_tables = tables;
+                    break;
+                }
+            }
+        }
+
+        if parsed_tables.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sort tables case-insensitively for consistent presentation across engines.
+        parsed_tables.sort_by_key(|a| a.name.to_lowercase());
+
+        // If any views were discovered, attempt to query information_schema.views
+        // to populate `updatable` (best-effort, ignored on error).
+        let has_views = parsed_tables.iter().any(|t| t.kind == ObjectKind::View);
+        if has_views {
+            let escaped_db = escape_string_literal(database);
+            let sql = format!(
+                "SELECT table_name, is_updatable FROM information_schema.views WHERE table_schema = '{escaped_db}'"
+            );
+            if let Ok(view_rows) = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                .fetch_all(&self.pool)
+                .await
+            {
+                let updatable_set: HashSet<String> = view_rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        let name: String = r.try_get(0).ok()?;
+                        let up: Option<String> = r.try_get(1).unwrap_or(None);
+                        if up.is_some_and(|v| v.eq_ignore_ascii_case("YES")) {
+                            Some(name)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for t in &mut parsed_tables {
+                    if t.kind == ObjectKind::View && updatable_set.contains(&t.name) {
+                        t.updatable = true;
+                    }
+                }
+            }
+        }
+
+        Ok(parsed_tables)
+    }
+
+    async fn list_tables_information_schema(&self, database: &str) -> Result<Vec<TableInfo>> {
+        let rows = sqlx::query(
+            "SELECT t.table_name, t.table_type, v.is_updatable \
+             FROM information_schema.tables AS t \
+             LEFT JOIN information_schema.views AS v \
+               ON v.table_schema = t.table_schema AND v.table_name = t.table_name \
+             WHERE t.table_schema = ? \
+             ORDER BY t.table_name",
+        )
+        .bind(database)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_query_error)?;
+
+        let mut tables = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get(0).map_err(map_query_error)?;
+            let table_type: String = row.try_get(1).map_err(map_query_error)?;
+            let updatable: Option<String> = row.try_get(2).unwrap_or(None);
+            let kind = if table_type.eq_ignore_ascii_case("VIEW") {
+                ObjectKind::View
+            } else {
+                ObjectKind::Table
+            };
+            tables.push(TableInfo {
+                name,
+                kind,
+                updatable: updatable.is_some_and(|value| value.eq_ignore_ascii_case("YES")),
+            });
+        }
+        Ok(tables)
+    }
+
+    async fn columns_show(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
+        let mut connection = self.pool.acquire().await.map_err(map_query_error)?;
+        if !database.is_empty() {
+            let _ = use_database(&mut connection, database).await;
+        }
+
+        let is_bare_db = database
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let is_bare_tbl = table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+        let mut queries = Vec::new();
+        if !database.is_empty() {
+            if is_bare_db && is_bare_tbl {
+                queries.push(format!("SHOW FULL COLUMNS FROM {table} FROM {database} "));
+                queries.push(format!("SHOW FULL COLUMNS FROM {table} "));
+                queries.push(format!("SHOW COLUMNS FROM {table} FROM {database} "));
+                queries.push(format!("SHOW COLUMNS FROM {table} "));
+            }
+            queries.push(format!(
+                "SHOW FULL COLUMNS FROM {} FROM {} ",
+                quote_identifier(table),
+                quote_identifier(database)
+            ));
+            queries.push(format!(
+                "SHOW FULL COLUMNS FROM {} ",
+                quote_identifier(table)
+            ));
+            queries.push(format!(
+                "SHOW COLUMNS FROM {} FROM {} ",
+                quote_identifier(table),
+                quote_identifier(database)
+            ));
+            queries.push(format!("SHOW COLUMNS FROM {} ", quote_identifier(table)));
+        } else {
+            if is_bare_tbl {
+                queries.push(format!("SHOW FULL COLUMNS FROM {table} "));
+                queries.push(format!("SHOW COLUMNS FROM {table} "));
+            }
+            queries.push(format!(
+                "SHOW FULL COLUMNS FROM {} ",
+                quote_identifier(table)
+            ));
+            queries.push(format!("SHOW COLUMNS FROM {} ", quote_identifier(table)));
+        }
+
+        let mut rows = Vec::new();
+        for q in queries {
+            if let Ok(r) = sqlx::raw_sql(sqlx::AssertSqlSafe(q))
+                .fetch_all(&mut *connection)
+                .await
+                && !r.is_empty()
+            {
+                rows = r;
+                break;
+            }
+        }
+
+        let mut columns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(name) = get_cell_text(&row, 0) else {
+                continue;
+            };
+            let data_type = get_cell_text(&row, 1).unwrap_or_else(|| "text".to_string());
+            // SHOW FULL COLUMNS: 0=Field, 1=Type, 2=Collation, 3=Null, 4=Key, 5=Default, 6=Extra, 7=Privileges, 8=Comment (len >= 9)
+            // SHOW COLUMNS:      0=Field, 1=Type, 2=Null, 3=Key, 4=Default, 5=Extra (len 6)
+            let (nullable, key, comment) = if row.columns().len() >= 9 {
+                (
+                    get_cell_text(&row, 3).unwrap_or_default(),
+                    get_cell_text(&row, 4).unwrap_or_default(),
+                    get_cell_text(&row, 8).unwrap_or_default(),
+                )
+            } else {
+                (
+                    get_cell_text(&row, 2).unwrap_or_default(),
+                    get_cell_text(&row, 3).unwrap_or_default(),
+                    String::new(),
+                )
+            };
+            columns.push(ColumnInfo {
+                name,
+                data_type,
+                nullable: nullable.eq_ignore_ascii_case("YES"),
+                primary_key: key.eq_ignore_ascii_case("PRI"),
+                comment,
+            });
+        }
+        Ok(columns)
+    }
+
+    async fn table_statuses_show(&self, database: &str) -> Result<Vec<(String, TableStatus)>> {
+        let is_bare = database
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let mut queries = Vec::new();
+        if !database.is_empty() {
+            if is_bare {
+                queries.push(format!("SHOW TABLE STATUS FROM {database} "));
+            }
+            queries.push(format!(
+                "SHOW TABLE STATUS FROM {} ",
+                quote_identifier(database)
+            ));
+            queries.push("SHOW TABLE STATUS ".to_string());
+        } else {
+            queries.push("SHOW TABLE STATUS ".to_string());
+        }
+
+        for sql in queries {
+            if let Ok(result) = self.execute_query(Some(database), &sql).await
+                && !result.rows.is_empty()
+            {
+                let name_idx = result
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("name"))
+                    .unwrap_or(0);
+                let engine_idx = result
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("engine"));
+                let rows_idx = result
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("rows"));
+                let auto_inc_idx = result
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("auto_increment"));
+                let updated_idx = result
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("update_time"));
+                let data_len_idx = result
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("data_length"));
+                let comment_idx = result
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("comment"));
+
+                let mut statuses = Vec::with_capacity(result.rows.len());
+                for row in result.rows {
+                    let Some(name_val) = row.get(name_idx) else {
+                        continue;
+                    };
+                    let name = match name_val {
+                        CellValue::Text(s) => s.clone(),
+                        other => other.as_display(),
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+
+                    let engine = engine_idx.and_then(|i| row.get(i)).and_then(text_value);
+                    let rows = rows_idx.and_then(|i| row.get(i)).and_then(u64_value);
+                    let auto_increment = auto_inc_idx.and_then(|i| row.get(i)).and_then(u64_value);
+                    let updated = updated_idx.and_then(|i| row.get(i)).and_then(text_value);
+                    let data_length = data_len_idx.and_then(|i| row.get(i)).and_then(u64_value);
+                    let comment = comment_idx.and_then(|i| row.get(i)).and_then(text_value);
+
+                    statuses.push((
+                        name,
+                        TableStatus {
+                            engine,
+                            rows,
+                            auto_increment,
+                            updated,
+                            data_length,
+                            comment,
+                            ..TableStatus::default()
+                        },
+                    ));
+                }
+                if !statuses.is_empty() {
+                    return Ok(statuses);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
+fn get_cell_text(row: &MySqlRow, idx: usize) -> Option<String> {
+    if let Ok(s) = row.try_get::<&str, _>(idx) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(s) = row.try_get::<String, _>(idx) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(bytes) = row.try_get::<&[u8], _>(idx) {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        let (cow, _, _) = encoding_rs::GB18030.decode(bytes);
+        let trimmed = cow.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+        let lossy = String::from_utf8_lossy(bytes);
+        let trimmed = lossy.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn parse_table_row(row: &MySqlRow, database: &str) -> Option<TableInfo> {
+    let num_cols = row.columns().len();
+    if num_cols == 0 {
+        return None;
+    }
+
+    let mut table_name: Option<String> = None;
+    let mut is_view = false;
+
+    // 1. Column name inspection
+    for (idx, col) in row.columns().iter().enumerate() {
+        let col_name = col.name().to_ascii_lowercase();
+        let Some(val_str) = get_cell_text(row, idx) else {
+            continue;
+        };
+
+        if col_name.contains("table_type") || col_name.contains("type") {
+            if val_str.eq_ignore_ascii_case("VIEW") || val_str.eq_ignore_ascii_case("SYSTEM VIEW") {
+                is_view = true;
+            }
+        } else if col_name.starts_with("tables_in")
+            || col_name.starts_with("tables in")
+            || col_name == "table_name"
+            || col_name == "name"
+        {
+            if !val_str.is_empty()
+                && !val_str.eq_ignore_ascii_case("BASE TABLE")
+                && !val_str.eq_ignore_ascii_case("VIEW")
+                && !val_str.eq_ignore_ascii_case("SYSTEM VIEW")
+            {
+                table_name = Some(val_str);
+            }
+        }
+    }
+
+    // 2. Value inspection across all columns
+    for idx in 0..num_cols {
+        let Some(val_str) = get_cell_text(row, idx) else {
+            continue;
+        };
+        if val_str.eq_ignore_ascii_case("VIEW") || val_str.eq_ignore_ascii_case("SYSTEM VIEW") {
+            is_view = true;
+        } else if val_str.eq_ignore_ascii_case("BASE TABLE")
+            || val_str.eq_ignore_ascii_case("TABLE")
+        {
+            // Identified as table type keyword
+        } else if num_cols > 1 && !database.is_empty() && val_str.eq_ignore_ascii_case(database) {
+            // If there are multiple columns and this one equals the database name, skip it
+        } else if table_name.is_none() && !val_str.is_empty() {
+            table_name = Some(val_str);
+        }
+    }
+
+    let name = table_name?;
+    let kind = if is_view {
+        ObjectKind::View
+    } else {
+        ObjectKind::Table
+    };
+
+    Some(TableInfo {
+        name,
+        kind,
+        updatable: false,
+    })
 }
 
 /// A pinned MySQL session for running a script statement by statement (see
@@ -204,7 +621,7 @@ impl Connection for MysqlConnection {
     }
 
     async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
-        let rows = sqlx::query("SHOW DATABASES")
+        let rows = sqlx::raw_sql("SHOW DATABASES")
             .fetch_all(&self.pool)
             .await
             .map_err(map_query_error)?;
@@ -218,66 +635,58 @@ impl Connection for MysqlConnection {
     }
 
     async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>> {
-        let rows = sqlx::query(
-            "SELECT t.table_name, t.table_type, v.is_updatable \
-             FROM information_schema.tables AS t \
-             LEFT JOIN information_schema.views AS v \
-               ON v.table_schema = t.table_schema AND v.table_name = t.table_name \
-             WHERE t.table_schema = ? \
-             ORDER BY t.table_name",
-        )
-        .bind(database)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_query_error)?;
-
-        let mut tables = Vec::with_capacity(rows.len());
-        for row in rows {
-            let name: String = row.try_get(0).map_err(map_query_error)?;
-            let table_type: String = row.try_get(1).map_err(map_query_error)?;
-            let updatable: Option<String> = row.try_get(2).unwrap_or(None);
-            let kind = if table_type.eq_ignore_ascii_case("VIEW") {
-                ObjectKind::View
-            } else {
-                ObjectKind::Table
-            };
-            tables.push(TableInfo {
-                name,
-                kind,
-                updatable: updatable.is_some_and(|value| value.eq_ignore_ascii_case("YES")),
-            });
+        match self.list_tables_show(database).await {
+            Ok(tables) if !tables.is_empty() => Ok(tables),
+            Ok(tables) => {
+                // If SHOW FULL TABLES returned empty, check information_schema as a secondary fallback.
+                if let Ok(info_tables) = self.list_tables_information_schema(database).await
+                    && !info_tables.is_empty()
+                {
+                    return Ok(info_tables);
+                }
+                Ok(tables)
+            }
+            Err(_) => self.list_tables_information_schema(database).await,
         }
-        Ok(tables)
     }
 
     async fn columns(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
-        let rows = sqlx::query(
+        let mut columns = Vec::new();
+        let escaped_db = escape_string_literal(database);
+        let escaped_table = escape_string_literal(table);
+        let sql = format!(
             "SELECT column_name, column_type, is_nullable, column_key, column_comment \
              FROM information_schema.columns \
-             WHERE table_schema = ? AND table_name = ? \
-             ORDER BY ordinal_position",
-        )
-        .bind(database)
-        .bind(table)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_query_error)?;
+             WHERE table_schema = '{escaped_db}' AND table_name = '{escaped_table}' \
+             ORDER BY ordinal_position"
+        );
+        let query_res = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await;
 
-        let mut columns = Vec::with_capacity(rows.len());
-        for row in rows {
-            let name: String = row.try_get(0).map_err(map_query_error)?;
-            let data_type: String = row.try_get(1).map_err(map_query_error)?;
-            let nullable: String = row.try_get(2).map_err(map_query_error)?;
-            let key: String = row.try_get(3).map_err(map_query_error)?;
-            let comment: String = row.try_get(4).unwrap_or_default();
-            columns.push(ColumnInfo {
-                name,
-                data_type,
-                nullable: nullable.eq_ignore_ascii_case("YES"),
-                primary_key: key.eq_ignore_ascii_case("PRI"),
-                comment,
-            });
+        if let Ok(rows) = query_res {
+            for row in rows {
+                let name: String = row.try_get(0).map_err(map_query_error)?;
+                let data_type: String = row.try_get(1).map_err(map_query_error)?;
+                let nullable: String = row.try_get(2).map_err(map_query_error)?;
+                let key: String = row.try_get(3).map_err(map_query_error)?;
+                let comment: String = row.try_get(4).unwrap_or_default();
+                columns.push(ColumnInfo {
+                    name,
+                    data_type,
+                    nullable: nullable.eq_ignore_ascii_case("YES"),
+                    primary_key: key.eq_ignore_ascii_case("PRI"),
+                    comment,
+                });
+            }
         }
+
+        // If information_schema.columns returned nothing (common in proxies like MyCat when
+        // a table resides on a non-default sharded data node), fall back to SHOW FULL COLUMNS.
+        if columns.is_empty() {
+            columns = self.columns_show(database, table).await?;
+        }
+
         Ok(columns)
     }
 
@@ -638,80 +1047,86 @@ impl Connection for MysqlConnection {
     }
 
     async fn table_statuses(&self, database: &str) -> Result<Vec<(String, TableStatus)>> {
-        let rows = sqlx::query(
+        let escaped_db = escape_string_literal(database);
+        let sql = format!(
             "SELECT table_name, engine, table_rows, auto_increment, update_time, data_length, \
                     table_comment \
              FROM information_schema.tables \
-             WHERE table_schema = ? AND table_type <> 'VIEW' \
-             ORDER BY table_name",
-        )
-        .bind(database)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_query_error)?;
+             WHERE table_schema = '{escaped_db}' AND table_type <> 'VIEW' \
+             ORDER BY table_name"
+        );
+        let rows_res = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&self.pool)
+            .await;
 
-        let mut statuses = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let name: String = row.try_get(0).map_err(map_query_error)?;
-            let engine: Option<String> = row.try_get(1).unwrap_or(None);
-            let updated = row
-                .try_get::<Option<chrono::NaiveDateTime>, _>(4)
-                .ok()
-                .flatten()
-                .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string());
-            statuses.push((
-                name,
-                TableStatus {
-                    engine,
-                    // `information_schema.tables.table_rows` is an InnoDB estimate and MySQL 8
-                    // caches it for `information_schema_stats_expiry` seconds. It is routinely 0
-                    // for a table with thousands of rows (and a refresh returns the same cached
-                    // value), so the exact count is filled in below.
-                    rows: optional_u64(row, 2),
-                    auto_increment: optional_u64(row, 3),
-                    updated,
-                    data_length: optional_u64(row, 5),
-                    comment: row.try_get(6).unwrap_or(None),
-                    ..TableStatus::default()
-                },
-            ));
-        }
-
-        // One `COUNT(*)` per table, batched into a single UNION ALL statement. The object list
-        // shows the real row count instead of the optimizer's estimate; a database with many
-        // tables pays one round trip and one scan per table.
-        if !statuses.is_empty() {
-            let mut sql = String::new();
-            for (index, (name, _)) in statuses.iter().enumerate() {
-                if index > 0 {
-                    sql.push_str(" UNION ALL ");
-                }
-                sql.push_str(&format!(
-                    "SELECT {} AS table_name, COUNT(*) AS exact_rows FROM {}.{}",
-                    quote_literal(name),
-                    quote_identifier(database),
-                    quote_identifier(name)
+        if let Ok(rows) = rows_res
+            && !rows.is_empty()
+        {
+            let mut statuses = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let name: String = row.try_get(0).map_err(map_query_error)?;
+                let engine: Option<String> = row.try_get(1).unwrap_or(None);
+                let updated = row
+                    .try_get::<Option<chrono::NaiveDateTime>, _>(4)
+                    .ok()
+                    .flatten()
+                    .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string());
+                statuses.push((
+                    name,
+                    TableStatus {
+                        engine,
+                        // `information_schema.tables.table_rows` is an InnoDB estimate and MySQL 8
+                        // caches it for `information_schema_stats_expiry` seconds. It is routinely 0
+                        // for a table with thousands of rows (and a refresh returns the same cached
+                        // value), so the exact count is filled in below.
+                        rows: optional_u64(row, 2),
+                        auto_increment: optional_u64(row, 3),
+                        updated,
+                        data_length: optional_u64(row, 5),
+                        comment: row.try_get(6).unwrap_or(None),
+                        ..TableStatus::default()
+                    },
                 ));
             }
-            // Best-effort: if a table disappears between the catalog read and the count (or the
-            // user's database forbids reading one), keep the catalog estimate instead of failing
-            // the whole object list.
-            let count_rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_default();
-            for row in &count_rows {
-                let name: String = row.try_get(0).map_err(map_query_error)?;
-                let count = optional_u64(row, 1).unwrap_or(0);
-                if let Some((_, status)) = statuses
-                    .iter_mut()
-                    .find(|(candidate, _)| candidate == &name)
-                {
-                    status.rows = Some(count);
+
+            // One `COUNT(*)` per table, batched into a single UNION ALL statement. The object list
+            // shows the real row count instead of the optimizer's estimate; a database with many
+            // tables pays one round trip and one scan per table.
+            if !statuses.is_empty() {
+                let mut sql = String::new();
+                for (index, (name, _)) in statuses.iter().enumerate() {
+                    if index > 0 {
+                        sql.push_str(" UNION ALL ");
+                    }
+                    sql.push_str(&format!(
+                        "SELECT {} AS table_name, COUNT(*) AS exact_rows FROM {}.{}",
+                        quote_literal(name),
+                        quote_identifier(database),
+                        quote_identifier(name)
+                    ));
+                }
+                // Best-effort: if a table disappears between the catalog read and the count (or the
+                // user's database forbids reading one), keep the catalog estimate instead of failing
+                // the whole object list.
+                let count_rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap_or_default();
+                for row in &count_rows {
+                    let name: String = row.try_get(0).map_err(map_query_error)?;
+                    let count = optional_u64(row, 1).unwrap_or(0);
+                    if let Some((_, status)) = statuses
+                        .iter_mut()
+                        .find(|(candidate, _)| candidate == &name)
+                    {
+                        status.rows = Some(count);
+                    }
                 }
             }
+            return Ok(statuses);
         }
-        Ok(statuses)
+
+        self.table_statuses_show(database).await
     }
 
     async fn object_ddl(

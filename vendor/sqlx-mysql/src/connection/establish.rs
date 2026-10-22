@@ -126,8 +126,14 @@ impl<'a> DoHandshake<'a> {
             None
         };
 
+        let charset = if handshake.server_default_collation != 0 {
+            handshake.server_default_collation
+        } else {
+            super::INITIAL_CHARSET
+        };
+
         stream.write_packet(HandshakeResponse {
-            charset: super::INITIAL_CHARSET,
+            charset,
             max_packet_size: MAX_PACKET_SIZE,
             username: &options.username,
             database: options.database.as_deref(),
